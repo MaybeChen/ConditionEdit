@@ -27,8 +27,8 @@ const groups = [
 ]
 
 const snippets = [
-  { name: 'if 条件块', tag: '#if … #endif', text: '{#if USER.a == USER.b}\n  \n{#endif}', select: 'USER.a' },
-  { name: 'elseif 分支', tag: '#elseif', text: '{#elseif USER.a == USER.b}\n  ', select: 'USER.a' },
+  { name: 'if 条件块', tag: '#if … #endif', text: '{#if USER.a == USER.b}\n  \n{#endif}', operands: ['USER.a', 'USER.b'] },
+  { name: 'elseif 分支', tag: '#elseif', text: '{#elseif USER.a == USER.b}\n  ', operands: ['USER.a', 'USER.b'] },
   { name: 'else 分支', tag: '#else', text: '{#else}\n  ' },
   { name: 'endif 结束', tag: '#endif', text: '{#endif}' },
 ]
@@ -47,12 +47,14 @@ const menu = ref(null)
 const caretProbe = ref(null)
 const activeChoice = ref(0)
 const menuPosition = ref({})
+const operandStep = ref(null)
 let feedbackTimer
 
 const lines = computed(() => source.value.split('\n'))
 const variableChoices = groups.flatMap(group => group.variables.map(name => ({
   name, detail: group.label, icon: group.icon,
 })))
+const variableNames = new Set(variableChoices.map(choice => choice.name.toLowerCase()))
 const snippetChoices = snippets.map(snippet => ({
   name: snippet.tag.split(' ')[0], detail: snippet.name, icon: GitBranch, snippet,
 }))
@@ -66,8 +68,12 @@ const choices = computed(() => {
 const highlighted = computed(() => source.value.split(/(\{#[^{}\n]*\}|\{[\w.]+\})/g).flatMap((part, index) => {
   if (index % 2 === 0) return [{ text: part }]
   if (!part.startsWith('{#')) return [{ text: part, type: 'variable' }]
-  return part.split(/(\b(?:SYS|USER)\.[\w]+\b|===|!==|==|!=|>=|<=|&&|\|\||[<>])/g)
-    .map((text, index) => ({ text, type: index % 2 === 0 ? 'directive' : /^\w/.test(text) ? 'variable' : 'operator' }))
+  return part.split(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[\w.]+|===|!==|==|!=|>=|<=|&&|\|\||[<>])/g)
+    .map((text, index) => {
+      if (index % 2 === 0) return { text, type: 'directive' }
+      if (variableNames.has(text.toLowerCase()) || /^(?:SYS|USER)\.\w+$/i.test(text)) return { text, type: 'variable' }
+      return { text, type: /^[=!<>&|]/.test(text) ? 'operator' : 'directive' }
+    })
 }))
 
 const issue = computed(() => {
@@ -168,19 +174,83 @@ async function openPicker(manual = false, replace = false, variablesOnly = false
 }
 
 function openVariablePicker() {
+  if (operandStep.value) {
+    picker.value = { ...picker.value, query: '' }
+    activeChoice.value = 0
+    nextTick(positionMenu)
+    return
+  }
   const { start, end } = selection.value
   editor.value.focus()
   editor.value.setSelectionRange(start, end)
   openPicker(true, false, true)
 }
 
+function closePicker() {
+  picker.value = null
+  operandStep.value = null
+}
+
+async function selectOperand(ranges, index = 0) {
+  const { start, end } = ranges[index]
+  const input = editor.value
+  input.setSelectionRange(start, end)
+  rememberSelection()
+  operandStep.value = {
+    index, ranges,
+    before: input.value.slice(0, start),
+    after: input.value.slice(end),
+  }
+  picker.value = { kind: 'operand', query: '', start, end }
+  activeChoice.value = 0
+  await nextTick()
+  positionMenu()
+}
+
 function onEditorInput(event) {
   rememberSelection()
-  if (!event.isComposing) openPicker()
+  if (event.isComposing) return
+  const step = operandStep.value
+  if (step) {
+    const value = editor.value.value
+    const start = step.before.length
+    const end = value.length - step.after.length
+    const inOperand = start <= end && value.startsWith(step.before) && value.endsWith(step.after)
+    if (inOperand && !event.inputType?.startsWith('history')) {
+      picker.value = { kind: 'operand', query: value.slice(start, end), start, end }
+      activeChoice.value = 0
+      nextTick(positionMenu)
+      return
+    }
+    closePicker()
+  }
+  if (!event.inputType?.startsWith('history')) openPicker()
+}
+
+async function confirmOperand(variable) {
+  const { index, ranges } = operandStep.value
+  const { start, end } = picker.value
+  const replacement = variable ?? editor.value.value.slice(start, end)
+  const shift = start + replacement.length - ranges[index].end
+  closePicker()
+  if (variable !== undefined) {
+    selection.value = { start, end }
+    await insert(replacement)
+  }
+  if (index + 1 < ranges.length) {
+    const adjusted = ranges.map((range, slot) => slot <= index
+      ? range
+      : { start: range.start + shift, end: range.end + shift })
+    await selectOperand(adjusted, index + 1)
+  }
 }
 
 function choose(choice) {
   if (!choice || !picker.value) return
+  if (operandStep.value) {
+    confirmOperand(choice.name)
+    return
+  }
   const { kind, start, end } = picker.value
   selection.value = { start, end }
   picker.value = null
@@ -192,13 +262,14 @@ async function onEditorKeydown(event) {
   if (event.isComposing || event.keyCode === 229) return
   if ((event.ctrlKey || event.metaKey) && event.code === 'Space') {
     event.preventDefault()
-    openPicker(true)
+    if (operandStep.value) openVariablePicker()
+    else openPicker(true)
     return
   }
   if (!picker.value) return
   if (event.key === 'Escape') {
     event.preventDefault()
-    picker.value = null
+    closePicker()
   } else if (choices.value.length && ['ArrowDown', 'ArrowUp'].includes(event.key)) {
     event.preventDefault()
     const count = choices.value.length
@@ -209,8 +280,11 @@ async function onEditorKeydown(event) {
   } else if (choices.value.length && (event.key === 'Enter' || (event.key === 'Tab' && !event.shiftKey))) {
     event.preventDefault()
     choose(choices.value[activeChoice.value])
+  } else if (operandStep.value && picker.value.query && (event.key === 'Enter' || (event.key === 'Tab' && !event.shiftKey))) {
+    event.preventDefault()
+    confirmOperand()
   } else if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown', 'Tab', 'Enter'].includes(event.key)) {
-    picker.value = null
+    closePicker()
   }
 }
 
@@ -223,7 +297,7 @@ async function insert(text, offset = text.length, length = 0) {
   if (!document.execCommand('insertText', false, text)) {
     input.setRangeText(text, start, end, 'end')
   }
-  picker.value = null
+  closePicker()
   source.value = input.value
   await nextTick()
   input.setSelectionRange(start + offset, start + offset + length)
@@ -232,6 +306,10 @@ async function insert(text, offset = text.length, length = 0) {
 }
 
 function insertVariable(variable) {
+  if (operandStep.value) {
+    confirmOperand(variable)
+    return
+  }
   const { start, end } = selection.value
   const before = source.value.slice(0, start).split('\n').at(-1)
   const after = source.value.slice(end).split('\n')[0]
@@ -240,14 +318,23 @@ function insertVariable(variable) {
   insert(insideCondition || insidePlaceholder ? variable : `{${variable}}`)
 }
 
-function insertSnippet(snippet) {
+async function insertSnippet(snippet) {
   const { start, end } = selection.value
   const before = source.value.slice(0, start).split('\n').at(-1)
   const after = source.value.slice(end).split('\n')[0]
   const prefix = before.trim() ? '\n' : ''
   const suffix = after.trim() ? '\n' : ''
-  const offset = snippet.select ? snippet.text.indexOf(snippet.select) : snippet.text.length
-  insert(prefix + snippet.text + suffix, prefix.length + offset, snippet.select?.length)
+  const text = prefix + snippet.text + suffix
+  if (!snippet.operands) {
+    await insert(text, prefix.length + snippet.text.length)
+    return
+  }
+  const ranges = snippet.operands.map(operand => {
+    const offset = prefix.length + snippet.text.indexOf(operand)
+    return { start: start + offset, end: start + offset + operand.length }
+  })
+  await insert(text, ranges[0].start - start, snippet.operands[0].length)
+  await selectOperand(ranges)
 }
 
 function notify(message) {
@@ -307,7 +394,8 @@ async function copySource() {
             <h2 id="editor-title">模板内容</h2>
           </div>
           <div class="editor-actions">
-            <button class="button secondary variable-picker-button" type="button" @click="openVariablePicker">
+            <button class="button secondary variable-picker-button" type="button"
+              @pointerdown="operandStep && $event.preventDefault()" @click="openVariablePicker">
               <Brackets :size="15" /> 选变量
             </button>
             <button class="button secondary" type="button" @click="loadExample"><RotateCcw :size="15" /> 载入示例</button>
@@ -326,14 +414,15 @@ async function copySource() {
               :aria-activedescendant="picker && choices.length ? 'editor-choice-' + activeChoice : undefined"
               placeholder="输入文本、变量或条件语句…" spellcheck="false"
               autocapitalize="off" autocomplete="off" wrap="off" @input="onEditorInput"
-              @select="rememberSelection" @click="rememberSelection(); picker = null"
+              @select="rememberSelection" @click="rememberSelection(); closePicker()"
               @dblclick="openPicker(true, true)" @keydown="onEditorKeydown"
-              @keyup="rememberSelection" @blur="picker = null" @scroll="syncScroll"></textarea>
+              @keyup="rememberSelection" @blur="closePicker" @scroll="syncScroll"></textarea>
             <template v-if="picker">
               <span ref="caretProbe" class="caret-probe" aria-hidden="true">{{ lines[position.line - 1]?.slice(0, position.column - 1) }}</span>
               <div ref="menu" class="completion-menu" :style="menuPosition">
                 <div class="completion-heading">
-                  {{ picker.kind === 'snippet' ? '快捷句式' : picker.kind === 'all' ? '插入变量或句式' : '选择变量' }}
+                  {{ operandStep ? `选择第 ${operandStep.index + 1} 个变量（共 ${operandStep.ranges.length} 个）`
+                    : picker.kind === 'snippet' ? '快捷句式' : picker.kind === 'all' ? '插入变量或句式' : '选择变量' }}
                   <span>↑ ↓ · Enter</span>
                 </div>
                 <div id="editor-choices" role="listbox" aria-label="插入候选项" class="completion-options">
@@ -344,7 +433,9 @@ async function copySource() {
                     <code>{{ choice.name }}</code><span>{{ choice.detail }}</span>
                   </div>
                 </div>
-                <div v-if="!choices.length" class="completion-empty" role="status">没有匹配项，可继续输入</div>
+                <div v-if="!choices.length" class="completion-empty" role="status">
+                  {{ operandStep && picker.query ? '没有匹配项，按 Enter 保留输入' : '没有匹配项，可继续输入' }}
+                </div>
               </div>
             </template>
           </div>
@@ -388,7 +479,8 @@ async function copySource() {
                 <ChevronDown :size="15" class="chevron" :class="{ closed: collapsed[group.label] }" />
               </button>
               <div v-if="!collapsed[group.label]" class="variable-chips">
-                <button v-for="variable in group.variables" :key="variable" class="chip" type="button" @click="insertVariable(variable)">
+                <button v-for="variable in group.variables" :key="variable" class="chip" type="button"
+                  @pointerdown="operandStep && $event.preventDefault()" @click="insertVariable(variable)">
                   <Plus :size="13" /> {{ variable }}
                 </button>
               </div>
@@ -413,7 +505,7 @@ async function copySource() {
       </div>
       <p>在编辑器中直接输入普通文本。点击右侧的变量可插入占位符，例如 <code v-text="'{USER.a}'"></code>。</p>
       <p>输入左花括号可筛选变量，再输入 <code>#</code> 可筛选句式。双击已有变量可以换成其他变量，也可以直接编辑变量名。</p>
-      <p>点击 <strong>if 条件块</strong> 插入成对的 <code>#if</code> 和 <code>#endif</code>。选中条件中的变量后，可点击右侧变量替换它。</p>
+      <p>插入 <code>#if</code> 或 <code>#elseif</code> 后，会依次选中两个变量。可选择候选项，或直接输入后按 Enter 确认。按 Esc 可退出逐项选择。</p>
       <p>在条件块内可添加多个 <code>#elseif</code>，以及一个位于最后的 <code>#else</code>。</p>
     </div>
   </dialog>
