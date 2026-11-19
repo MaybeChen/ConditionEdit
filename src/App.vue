@@ -42,9 +42,27 @@ const position = ref({ line: 1, column: 1 })
 const selection = ref({ start: 0, end: 0 })
 const feedback = ref('')
 const collapsed = ref({})
+const picker = ref(null)
+const menu = ref(null)
+const caretProbe = ref(null)
+const activeChoice = ref(0)
+const menuPosition = ref({})
 let feedbackTimer
 
 const lines = computed(() => source.value.split('\n'))
+const variableChoices = groups.flatMap(group => group.variables.map(name => ({
+  name, detail: group.label, icon: group.icon,
+})))
+const snippetChoices = snippets.map(snippet => ({
+  name: snippet.tag.split(' ')[0], detail: snippet.name, icon: GitBranch, snippet,
+}))
+const choices = computed(() => {
+  if (!picker.value) return []
+  const { kind, query } = picker.value
+  const options = kind === 'snippet' ? snippetChoices
+    : kind === 'all' ? [...variableChoices, ...snippetChoices] : variableChoices
+  return options.filter(choice => choice.name.toLowerCase().startsWith(query.toLowerCase()))
+})
 const highlighted = computed(() => source.value.split(/(\{#[^{}\n]*\}|\{[\w.]+\})/g).flatMap((part, index) => {
   if (index % 2 === 0) return [{ text: part }]
   if (!part.startsWith('{#')) return [{ text: part, type: 'variable' }]
@@ -87,6 +105,113 @@ function syncScroll() {
   highlight.value.scrollTop = editor.value.scrollTop
   highlight.value.scrollLeft = editor.value.scrollLeft
   gutter.value.scrollTop = editor.value.scrollTop
+  if (picker.value) positionMenu()
+}
+
+function positionMenu() {
+  if (!menu.value || !caretProbe.value) return
+  const input = editor.value
+  const lineHeight = Number.parseFloat(getComputedStyle(input).lineHeight)
+  const caretLeft = caretProbe.value.offsetWidth + caretProbe.value.offsetLeft - input.scrollLeft
+  const caretBottom = lineHeight * position.value.line + caretProbe.value.offsetTop - input.scrollTop
+  const width = menu.value.offsetWidth
+  const height = menu.value.offsetHeight
+  const top = caretBottom + height + 8 <= input.clientHeight
+    ? caretBottom + 4 : caretBottom - lineHeight - height - 4
+  menuPosition.value = {
+    left: `${Math.max(4, Math.min(caretLeft, input.clientWidth - width - 4))}px`,
+    top: `${Math.max(4, Math.min(top, input.clientHeight - height - 4))}px`,
+  }
+}
+
+function completionContext(manual, replace) {
+  const { start, end } = selection.value
+  const value = editor.value.value
+  const before = value.slice(0, start).split('\n').at(-1)
+  const after = value.slice(end).split('\n')[0]
+  const selected = value.slice(start, end)
+  const directive = before.match(/\{(#[a-z]*)$/i)
+  if (directive && start === end && !replace) {
+    const suffix = after.match(/^[a-z]*\}?/i)[0]
+    return { kind: 'snippet', query: directive[1], start: start - directive[0].length, end: end + suffix.length }
+  }
+  const placeholder = before.match(/\{([\w.]*)$/)
+  if (placeholder && !selected.includes('}')) {
+    const suffix = after.match(/^[\w.]*\}?/)[0]
+    return {
+      kind: 'variable', query: manual ? '' : placeholder[1],
+      start: start - placeholder[0].length, end: end + suffix.length,
+    }
+  }
+  const condition = /\{#(?:if|elseif)\s+[^{}]*$/.test(before)
+  if (condition) {
+    const prefix = before.match(/[\w.]*$/)[0]
+    const suffix = after.match(/^[\w.]*/)[0]
+    if (manual || prefix) {
+      return { kind: 'operand', query: manual ? '' : prefix, start: start - prefix.length, end: end + suffix.length }
+    }
+  }
+  if (manual && !replace) return { kind: 'all', query: '', start, end }
+  return null
+}
+
+async function openPicker(manual = false, replace = false, variablesOnly = false) {
+  rememberSelection()
+  const context = completionContext(manual, replace)
+  if (replace && (!context || !['variable', 'operand'].includes(context.kind))) return
+  picker.value = variablesOnly && context
+    ? { ...context, kind: context.kind === 'operand' ? 'operand' : 'variable', query: '' }
+    : context
+  activeChoice.value = 0
+  await nextTick()
+  positionMenu()
+}
+
+function openVariablePicker() {
+  const { start, end } = selection.value
+  editor.value.focus()
+  editor.value.setSelectionRange(start, end)
+  openPicker(true, false, true)
+}
+
+function onEditorInput(event) {
+  rememberSelection()
+  if (!event.isComposing) openPicker()
+}
+
+function choose(choice) {
+  if (!choice || !picker.value) return
+  const { kind, start, end } = picker.value
+  selection.value = { start, end }
+  picker.value = null
+  if (choice.snippet) insertSnippet(choice.snippet)
+  else insert(kind === 'operand' ? choice.name : `{${choice.name}}`)
+}
+
+async function onEditorKeydown(event) {
+  if (event.isComposing || event.keyCode === 229) return
+  if ((event.ctrlKey || event.metaKey) && event.code === 'Space') {
+    event.preventDefault()
+    openPicker(true)
+    return
+  }
+  if (!picker.value) return
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    picker.value = null
+  } else if (choices.value.length && ['ArrowDown', 'ArrowUp'].includes(event.key)) {
+    event.preventDefault()
+    const count = choices.value.length
+    const step = event.key === 'ArrowDown' ? 1 : -1
+    activeChoice.value = (activeChoice.value + step + count) % count
+    await nextTick()
+    menu.value?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' })
+  } else if (choices.value.length && (event.key === 'Enter' || (event.key === 'Tab' && !event.shiftKey))) {
+    event.preventDefault()
+    choose(choices.value[activeChoice.value])
+  } else if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown', 'Tab', 'Enter'].includes(event.key)) {
+    picker.value = null
+  }
 }
 
 async function insert(text, offset = text.length, length = 0) {
@@ -98,6 +223,7 @@ async function insert(text, offset = text.length, length = 0) {
   if (!document.execCommand('insertText', false, text)) {
     input.setRangeText(text, start, end, 'end')
   }
+  picker.value = null
   source.value = input.value
   await nextTick()
   input.setSelectionRange(start + offset, start + offset + length)
@@ -181,6 +307,9 @@ async function copySource() {
             <h2 id="editor-title">模板内容</h2>
           </div>
           <div class="editor-actions">
+            <button class="button secondary variable-picker-button" type="button" @click="openVariablePicker">
+              <Brackets :size="15" /> 选变量
+            </button>
             <button class="button secondary" type="button" @click="loadExample"><RotateCcw :size="15" /> 载入示例</button>
             <button class="button primary" type="button" @click="copySource"><Copy :size="15" /> 复制文本</button>
           </div>
@@ -192,9 +321,32 @@ async function copySource() {
           </div>
           <div class="input-area">
             <pre ref="highlight" class="highlight" aria-hidden="true"><span v-for="(token, index) in highlighted" :key="index" :class="token.type">{{ token.text }}</span>{{ '\n' }}</pre>
-            <textarea ref="editor" v-model="source" aria-label="模板内容" placeholder="输入文本、变量或条件语句…" spellcheck="false"
-              autocapitalize="off" autocomplete="off" wrap="off" @input="rememberSelection" @select="rememberSelection"
-              @click="rememberSelection" @keyup="rememberSelection" @scroll="syncScroll"></textarea>
+            <textarea ref="editor" v-model="source" aria-label="模板内容" aria-describedby="editor-hint"
+              aria-autocomplete="list" :aria-controls="picker ? 'editor-choices' : undefined"
+              :aria-activedescendant="picker && choices.length ? 'editor-choice-' + activeChoice : undefined"
+              placeholder="输入文本、变量或条件语句…" spellcheck="false"
+              autocapitalize="off" autocomplete="off" wrap="off" @input="onEditorInput"
+              @select="rememberSelection" @click="rememberSelection(); picker = null"
+              @dblclick="openPicker(true, true)" @keydown="onEditorKeydown"
+              @keyup="rememberSelection" @blur="picker = null" @scroll="syncScroll"></textarea>
+            <template v-if="picker">
+              <span ref="caretProbe" class="caret-probe" aria-hidden="true">{{ lines[position.line - 1]?.slice(0, position.column - 1) }}</span>
+              <div ref="menu" class="completion-menu" :style="menuPosition">
+                <div class="completion-heading">
+                  {{ picker.kind === 'snippet' ? '快捷句式' : picker.kind === 'all' ? '插入变量或句式' : '选择变量' }}
+                  <span>↑ ↓ · Enter</span>
+                </div>
+                <div id="editor-choices" role="listbox" aria-label="插入候选项" class="completion-options">
+                  <div v-for="(choice, index) in choices" :id="'editor-choice-' + index" :key="choice.name"
+                    role="option" :aria-selected="index === activeChoice" class="completion-option"
+                    @pointerdown.prevent @click="choose(choice)">
+                    <component :is="choice.icon" :size="15" />
+                    <code>{{ choice.name }}</code><span>{{ choice.detail }}</span>
+                  </div>
+                </div>
+                <div v-if="!choices.length" class="completion-empty" role="status">没有匹配项，可继续输入</div>
+              </div>
+            </template>
           </div>
         </div>
 
@@ -246,7 +398,10 @@ async function copySource() {
       </aside>
     </div>
 
-    <footer class="workspace-footer"><Terminal :size="15" /> 句式和变量会插入到光标位置，或替换选中的文本。</footer>
+    <footer id="editor-hint" class="workspace-footer">
+      <Terminal :size="15" />
+      <span>输入 <kbd>{</kbd> 选变量，输入 <kbd>{#</kbd> 选句式，也可按 <kbd>Ctrl / ⌘ + Space</kbd> 打开候选。</span>
+    </footer>
   </main>
 
   <dialog ref="help" class="help-dialog" @click.self="help.close()">
@@ -257,6 +412,7 @@ async function copySource() {
         <button class="help-button close-button" type="button" aria-label="关闭" @click="help.close()"><X :size="19" /></button>
       </div>
       <p>在编辑器中直接输入普通文本。点击右侧的变量可插入占位符，例如 <code v-text="'{USER.a}'"></code>。</p>
+      <p>输入左花括号可筛选变量，再输入 <code>#</code> 可筛选句式。双击已有变量可以换成其他变量，也可以直接编辑变量名。</p>
       <p>点击 <strong>if 条件块</strong> 插入成对的 <code>#if</code> 和 <code>#endif</code>。选中条件中的变量后，可点击右侧变量替换它。</p>
       <p>在条件块内可添加多个 <code>#elseif</code>，以及一个位于最后的 <code>#else</code>。</p>
     </div>

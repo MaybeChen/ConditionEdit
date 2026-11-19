@@ -120,3 +120,51 @@ textarea::placeholder { color: #81786f; }
   .highlight, textarea { padding-left: 11px; }
   .editor-status { padding-inline: 9px; }
 }
+
+.caret-probe {
+  position: absolute;
+  top: 18px;
+  left: 18px;
+  visibility: hidden;
+  white-space: pre;
+  font: 14px/27px var(--mono);
+  font-variant-ligatures: none;
+  tab-size: 2;
+  pointer-events: none;
+}
+.completion-menu {
+  position: absolute;
+  z-index: 2;
+  width: min(290px, calc(100% - 13px));
+  border: 1px solid #e7dace;
+  border-radius: 9px;
+  background: #fffdfb;
+  box-shadow: 0 8px 24px #38270d24;
+  overflow: hidden;
+}
+.completion-heading, .completion-option { display: flex; align-items: center; gap: 8px; }
+.completion-heading {
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: #f8f4ee;
+  font-size: 12px;
+  font-weight: 650;
+}
+.completion-heading span { color: var(--muted); font: 11px var(--mono); }
+.completion-options { max-height: 198px; overflow: auto; }
+.completion-option { padding: 7px 10px; color: #6c5140; font-size: 12px; cursor: pointer; }
+.completion-option:hover, .completion-option[aria-selected="true"] { background: #f8e9dc; }
+.completion-option code { color: #773d25; font: 13px var(--mono); }
+.completion-option span { margin-left: auto; color: var(--muted); }
+.completion-empty { padding: 10px; color: var(--muted); font-size: 12px; }
+.workspace-footer kbd { color: #794831; font: inherit; font-weight: 700; }
+.workspace-footer svg { flex-shrink: 0; }
+
+@media (max-width: 700px) {
+  .caret-probe { left: 11px; }
+  .variable-picker-button svg { display: none; }
+}
+@media (max-width: 370px) {
+  .editor-actions .button svg { display: none; }
+}
